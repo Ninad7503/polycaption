@@ -1,0 +1,10 @@
+venv/
+*.mp4
+*.mp3
+*.srt
+done.txt
+temp_chunks/
+temp_audio.mp3
+temp_subtitle.srt
+__pycache__/
+(*Video_folder_of_your_choice)/
