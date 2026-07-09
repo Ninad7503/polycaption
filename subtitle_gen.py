@@ -19,9 +19,9 @@ LANGUAGES = {
 }
 
 
-VIDEO_FOLDER  = "/Users/ninadshinde/Desktop/Videos/OzarkS2"           # as input
-OUTPUT_FOLDER =  "/Users/ninadshinde/Desktop/Videos/OzarkS2/Ozark"           # as output
-SRT_FOLDER    = "/Users/ninadshinde/Desktop/Videos/OzarkS2/Ozark/srt"       # as output
+VIDEO_FOLDER  =  "Path name where all videos are stored "          # as input
+OUTPUT_FOLDER =  "Path name of the output files"           # as output
+SRT_FOLDER    = "srt file path"       # as output
 CHUNK_MINS    = 8                       # may vary
 WHISPER_MODEL = "medium"                 # Accuracy level(time required ) - large > medium > small > base
 TRANSLATE_TIMEOUT = 8                    # seconds per segment before falling back to original text
