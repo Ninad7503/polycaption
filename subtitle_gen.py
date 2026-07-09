@@ -1,8 +1,10 @@
 import os
+import json
 import math
 import time
 import whisper
 from pydub import AudioSegment
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 
 LANGUAGES = {
@@ -17,11 +19,12 @@ LANGUAGES = {
 }
 
 
-VIDEO_FOLDER  = "VIDEO-PATH"            # as input
-OUTPUT_FOLDER = "OUTPUT-PATH"           # as output
-SRT_FOLDER    = "SRT-FILES-PATH"        # as output
-CHUNK_MINS    = 8                       # may vary 
-WHISPER_MODEL = "small"                 # Accuracy level(time required ) - large > medium > small > base
+VIDEO_FOLDER  = "/Users/ninadshinde/Desktop/Videos/OzarkS2"           # as input
+OUTPUT_FOLDER =  "/Users/ninadshinde/Desktop/Videos/OzarkS2/Ozark"           # as output
+SRT_FOLDER    = "/Users/ninadshinde/Desktop/Videos/OzarkS2/Ozark/srt"       # as output
+CHUNK_MINS    = 8                       # may vary
+WHISPER_MODEL = "medium"                 # Accuracy level(time required ) - large > medium > small > base
+TRANSLATE_TIMEOUT = 8                    # seconds per segment before falling back to original text
 
 
 def load_model():
@@ -99,21 +102,62 @@ def transcribe_chunks(chunks, model):
     return all_segments
 
 
-def translate_and_save_srts(segments, output_path, episode_num):
-    from deep_translator import GoogleTranslator
+# ---------------------------------------------------------------------------
+# Segment caching — so a translation hang/crash never costs you re-transcribing
+# ---------------------------------------------------------------------------
 
+def save_segments_cache(segments, cache_path):
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(segments, f, ensure_ascii=False, indent=2)
+
+
+def load_segments_cache(cache_path):
+    with open(cache_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Translation with a hard per-segment timeout so a stalled request can never
+# freeze the whole script.
+# ---------------------------------------------------------------------------
+
+def _translate_call(text, lang_code):
+    from deep_translator import GoogleTranslator
+    return GoogleTranslator(source="auto", target=lang_code).translate(text)
+
+
+def translate_one_segment(text, lang_code, timeout=TRANSLATE_TIMEOUT):
+    if not text.strip():
+        return text
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(_translate_call, text, lang_code)
+        try:
+            result = future.result(timeout=timeout)
+            return result if result else text
+        except FutureTimeoutError:
+            return None   # signal caller: fall back to original text
+        except Exception:
+            return None
+
+
+def translate_and_save_srts(segments, output_path, episode_num, srt_lang_folder):
     for lang_code, lang_name in LANGUAGES.items():
-        print(f"         translating to {lang_name}...", end=" ", flush=True)
+        lang_srt_path = os.path.join(srt_lang_folder, f"ep{episode_num}.{lang_code}.srt")
+
+        # Resume support: skip a language if it was already fully translated
+        if os.path.exists(lang_srt_path):
+            print(f"         {lang_name} already translated — skipping")
+            continue
+
+        print(f"         translating to {lang_name}...", flush=True)
 
         translated_segments = []
-        for seg in segments:
-            try:
-                translated_text = GoogleTranslator(
-                    source="auto",
-                    target=lang_code
-                ).translate(seg["text"])
-            except Exception:
-                translated_text = seg["text"]  # Rollback
+        fail_count = 0
+        for i, seg in enumerate(segments):
+            translated_text = translate_one_segment(seg["text"], lang_code)
+            if translated_text is None:
+                translated_text = seg["text"]  # fallback, never hang
+                fail_count += 1
 
             translated_segments.append({
                 "start": seg["start"],
@@ -121,15 +165,16 @@ def translate_and_save_srts(segments, output_path, episode_num):
                 "text":  translated_text
             })
 
-       
-        srt_path = os.path.join(OUTPUT_FOLDER, f"ep{episode_num}.{lang_code}.srt")
-        with open(srt_path, "w", encoding="utf-8") as f:
+            if i % 50 == 0 or i == len(segments) - 1:
+                print(f"           [{i+1}/{len(segments)}] (failed/timeout: {fail_count})", flush=True)
+
+        with open(lang_srt_path, "w", encoding="utf-8") as f:
             for i, seg in enumerate(translated_segments, 1):
                 f.write(f"{i}\n")
                 f.write(f"{seconds_to_srt_time(seg['start'])} --> {seconds_to_srt_time(seg['end'])}\n")
                 f.write(f"{seg['text']}\n\n")
 
-        
+        print(f"         {lang_name} done ({fail_count} fell back to original text)")
 
     print(f"         all languages saved successfully")
 
@@ -155,6 +200,10 @@ def generate_srt(segments, srt_path):
 def burn_subtitles(video_path, srt_path, output_path):
     print(f"\n   [4/4] Embedding subtitles into video...")
 
+    if os.path.exists(output_path):
+        print(f"         output already exists — skipping burn")
+        return
+
     result = os.system(
         f'ffmpeg -i "{video_path}" -i "{srt_path}" '
         f'-c copy -c:s mov_text '
@@ -164,7 +213,6 @@ def burn_subtitles(video_path, srt_path, output_path):
     if not os.path.exists(output_path):
         raise RuntimeError(f"FFmpeg failed — exit code {result}")
 
-    
     import shutil
     srt_alongside = output_path.replace(".mp4", ".srt")
     shutil.copy(srt_path, srt_alongside)
@@ -178,7 +226,7 @@ def cleanup(audio_path, chunks):
     if os.path.exists(audio_path):
         os.remove(audio_path)
     if os.path.exists("temp_chunks"):
-        shutil.rmtree("temp_chunks")  
+        shutil.rmtree("temp_chunks")
 
 
 DONE_LOG = os.path.join(VIDEO_FOLDER, "done.txt")
@@ -219,17 +267,25 @@ def main():
             print("  ⏭️  Already processed — skipping")
             continue
 
-        output_path = os.path.join(OUTPUT_FOLDER, f"ep{idx+1}.mp4")
-        srt_path    = os.path.join(SRT_FOLDER,    f"ep{idx+1}.srt")
+        output_path  = os.path.join(OUTPUT_FOLDER, f"ep{idx+1}.mp4")
+        srt_path     = os.path.join(SRT_FOLDER,    f"ep{idx+1}.srt")
+        segments_cache_path = os.path.join(SRT_FOLDER, f"ep{idx+1}.segments.json")
 
         try:
-            audio_path = extract_audio(video_path)
-            chunks     = split_audio(audio_path)
-            segments   = transcribe_chunks(chunks, model)
+            # --- Transcription (skipped if we already have a cached transcript) ---
+            if os.path.exists(segments_cache_path):
+                print("  ⏭️  Found cached transcript — skipping audio extraction/transcription")
+                segments = load_segments_cache(segments_cache_path)
+            else:
+                audio_path = extract_audio(video_path)
+                chunks     = split_audio(audio_path)
+                segments   = transcribe_chunks(chunks, model)
+                save_segments_cache(segments, segments_cache_path)
+                cleanup(audio_path, chunks)
+
             generate_srt(segments, srt_path)
             burn_subtitles(video_path, srt_path, output_path)
-            translate_and_save_srts(segments, output_path, idx+1)
-            cleanup(audio_path, chunks)
+            translate_and_save_srts(segments, output_path, idx+1, SRT_FOLDER)
             mark_done(video_path)
             print(f"\n  ✅ VIDEO {idx+1} COMPLETE → ep{idx+1}.mp4")
 
